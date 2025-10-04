@@ -1,6 +1,8 @@
 // Assignment 2  - Advances in Operating Systems
 // Code by Ajitesh Jamulkar 22CS10004
 // and Ansh Sahu 22CS10010
+//
+// CONCURRENCY UPDATE: Added mutex locks to ensure thread-safety for read/write operations.
 // File: ~/lkm_assignment/kernel_module/lkm_queue.c
 
 #include <linux/module.h>
@@ -8,22 +10,22 @@
 #include <linux/proc_fs.h>
 #include <linux/slab.h>    // For kmalloc/kfree
 #include <linux/uaccess.h> // For copy_to_user/copy_from_user
-#include <linux/kdev_t.h>  // For MAJOR and MINOR macros
+#include <linux/mutex.h>   // For mutex locks
 #include <linux/version.h> // For LINUX_VERSION_CODE and KERNEL_VERSION
 
 MODULE_LICENSE("DUAL BSD/GPL");
+MODULE_AUTHOR("Ajitesh Jamulkar & Ansh Sahu");
+MODULE_DESCRIPTION("A thread-safe kernel module for a concurrent integer queue.");
 
-#define PROCFS_NAME "lkm_22CS10004_22CS10010"
-
-// This struct holds all data for a single process's queue.
 struct process_queue
 {
-    int *data;        // Pointer to the queue's integer array
-    int head;         // Index of the front element
-    int tail;         // Index of the next free spot
-    int size;         // Current number of elements
-    int capacity;     // Maximum capacity (N)
-    bool initialized; // Flag to check if capacity has been set
+    int *data;
+    int head;
+    int tail;
+    int size;
+    int capacity;
+    bool initialized;
+    struct mutex lock; // Mutex to protect this specific queue from concurrent access
 };
 
 // --- Function Prototypes for File Operations ---
@@ -31,6 +33,8 @@ static int lkm_open(struct inode *inode, struct file *file);
 static int lkm_release(struct inode *inode, struct file *file);
 static ssize_t lkm_read(struct file *filp, char __user *user_buf, size_t count, loff_t *f_pos);
 static ssize_t lkm_write(struct file *filp, const char __user *user_buf, size_t count, loff_t *f_pos);
+
+// Proc file operations struct for modern kernels
 static struct proc_ops lkm_proc_ops = {
     .proc_open = lkm_open,
     .proc_release = lkm_release,
@@ -38,25 +42,20 @@ static struct proc_ops lkm_proc_ops = {
     .proc_write = lkm_write,
 };
 
-/**
- * @brief Called when a process opens the proc file.
- * [cite_start]Allocates a private queue structure for the process. [cite: 45]
- */
 static int lkm_open(struct inode *inode, struct file *file)
 {
     struct process_queue *queue;
 
-    pr_info("proc file opened.\n");
+    printk(KERN_INFO "lkm_queue: Process ID %d opened the proc file.\n", current->pid);
 
-    // Allocate memory for our private queue struct
     queue = kmalloc(sizeof(struct process_queue), GFP_KERNEL);
     if (!queue)
     {
-        pr_warn("Failed to allocate memory for queue struct.\n");
+        printk(KERN_ERR "lkm_queue: Failed to allocate memory for queue struct.\n");
         return -ENOMEM;
     }
 
-    // Initialize the queue state
+    // Initialize queue state
     queue->data = NULL;
     queue->head = 0;
     queue->tail = 0;
@@ -64,77 +63,73 @@ static int lkm_open(struct inode *inode, struct file *file)
     queue->capacity = 0;
     queue->initialized = false;
 
-    // Store the pointer in the file's private data field
-    file->private_data = queue;
+    // Initialize the mutex for this queue instance
+    mutex_init(&queue->lock);
 
-    return 0; // Success
+    file->private_data = queue;
+    return 0;
 }
 
-/**
- * @brief Called when a process closes the proc file.
- * [cite_start]Frees all resources allocated for that process's queue. [cite: 43]
- */
 static int lkm_release(struct inode *inode, struct file *file)
 {
     struct process_queue *queue = file->private_data;
-
-    pr_info("proc file closed.\n");
+    printk(KERN_INFO "lkm_queue: Process ID %d closed the file.\n", current->pid);
 
     if (queue)
     {
-        // Free the integer array if it was allocated
+        // The mutex does not need to be explicitly destroyed when the object is freed.
         kfree(queue->data);
-        // Free the queue struct itself
         kfree(queue);
     }
-
-    return 0; // Success
+    return 0;
 }
 
-/**
- * @brief Called on a read() call. Dequeues all elements.
- * [cite_start]Returns all elements currently in the queue in FIFO order. [cite: 34]
- */
 static ssize_t lkm_read(struct file *filp, char __user *user_buf, size_t count, loff_t *f_pos)
 {
     struct process_queue *queue = filp->private_data;
     int bytes_to_read;
     int *temp_buf;
     int i;
+    int retval;
 
-    // Reading from the same position again gives nothing
-    if (*f_pos > 0)
+    // Acquire lock to ensure atomic read of the whole queue
+    if (mutex_lock_interruptible(&queue->lock))
     {
-        return 0;
+        return -ERESTARTSYS;
     }
 
-    // Check if the queue is empty
+    if (*f_pos > 0)
+    {
+        retval = 0;
+        goto out;
+    }
+
     if (queue->size == 0)
     {
-        return -EACCES;
-        [cite_start] // Return -EACCES if the queue is empty [cite: 38]
+        printk(KERN_INFO "lkm_queue: Queue is empty, nothing to read.\n");
+        retval = -EACCES;
+        goto out;
     }
 
     bytes_to_read = queue->size * sizeof(int);
-
-    // Allocate a temporary kernel buffer to assemble the output
     temp_buf = kmalloc(bytes_to_read, GFP_KERNEL);
     if (!temp_buf)
     {
-        return -ENOMEM;
+        retval = -ENOMEM;
+        goto out;
     }
 
-    // Copy elements from the circular buffer to the linear temporary buffer
+    // Assemble data in FIFO order
     for (i = 0; i < queue->size; ++i)
     {
         temp_buf[i] = queue->data[(queue->head + i) % queue->capacity];
     }
 
-    // Copy the assembled data to the user
     if (copy_to_user(user_buf, temp_buf, bytes_to_read))
     {
         kfree(temp_buf);
-        return -EFAULT;
+        retval = -EFAULT;
+        goto out;
     }
 
     kfree(temp_buf);
@@ -145,96 +140,107 @@ static ssize_t lkm_read(struct file *filp, char __user *user_buf, size_t count, 
     queue->size = 0;
 
     *f_pos += bytes_to_read;
+    retval = bytes_to_read;
 
-    return bytes_to_read;
-    [cite_start] // Return number of bytes read [cite: 36]
+out:
+    mutex_unlock(&queue->lock); // Release the lock
+    return retval;
 }
 
-/**
- * @brief Called on a write() call. Initializes or enqueues.
- */
 static ssize_t lkm_write(struct file *filp, const char __user *user_buf, size_t count, loff_t *f_pos)
 {
     struct process_queue *queue = filp->private_data;
+    int retval;
 
-    // --- Stage 1: Initialization ---
+    // Acquire lock to ensure atomic write operation
+    if (mutex_lock_interruptible(&queue->lock))
+    {
+        return -ERESTARTSYS;
+    }
+
+    // Stage 1: Initialization
     if (!queue->initialized)
     {
         char capacity_char;
 
         if (count != 1)
         {
-            pr_warn("Initialization failed: write must be exactly 1 byte.\n");
-            return -EINVAL;
+            pr_warn("lkm_queue: Initialization failed: write must be exactly 1 byte.\n");
+            retval = -EINVAL;
+            goto out;
         }
 
         if (copy_from_user(&capacity_char, user_buf, 1))
         {
-            return -EFAULT;
+            retval = -EFAULT;
+            goto out;
         }
 
-        [cite_start] // Check if N is within the valid range [1, 100] [cite: 25]
-            if (capacity_char < 1 || capacity_char > 100)
+        if (capacity_char < 1 || capacity_char > 100)
         {
-            pr_warn("Initialization failed: capacity %d is out of range (1-100).\n", capacity_char);
-            return -EINVAL;
-            [cite_start] // Return EINVAL if N is invalid [cite: 26]
+            printk(KERN_INFO "lkm_queue: Invalid capacity %d from PID %d\n", capacity_char, current->pid);
+            retval = -EINVAL;
+            goto out;
         }
 
         queue->capacity = (int)capacity_char;
         queue->data = kmalloc(queue->capacity * sizeof(int), GFP_KERNEL);
         if (!queue->data)
         {
-            return -ENOMEM;
+            retval = -ENOMEM;
+            goto out;
         }
 
         queue->initialized = true;
-        pr_info("Queue initialized with capacity %d\n", queue->capacity);
-        return 1; // Return bytes written
+        printk(KERN_INFO "lkm_queue: PID %d initialized queue with capacity %d\n", current->pid, queue->capacity);
+        retval = 1; // successful write of 1 byte
+        goto out;
     }
 
-    // --- Stage 2: Enqueue Operation ---
-    [cite_start] // Argument size must be a 32-bit integer (4 bytes) [cite: 28, 31]
-        if (count != sizeof(int))
+    // Stage 2: Enqueue Operation
+    if (count != sizeof(int))
     {
-        return -EINVAL;
+        retval = -EINVAL;
+        goto out;
     }
 
-    // Check if the queue is full
     if (queue->size == queue->capacity)
     {
-        return -EACCES;
-        [cite_start] // Return -EACCES if full [cite: 30]
+        retval = -EACCES; // Queue is full
+        goto out;
     }
 
-    // Copy integer from user space and add to queue
     if (copy_from_user(&queue->data[queue->tail], user_buf, sizeof(int)))
     {
-        return -EFAULT;
+        retval = -EFAULT;
+        goto out;
     }
 
-    // Update tail and size for the circular buffer
     queue->tail = (queue->tail + 1) % queue->capacity;
     queue->size++;
+    retval = sizeof(int);
 
-    return sizeof(int);
-    [cite_start] // Return number of bytes written [cite: 29]
+out:
+    mutex_unlock(&queue->lock); // Release the lock
+    return retval;
 }
 
-// --- Module Init and Exit ---
 static int __init lkm_init(void)
 {
-    [cite_start] // Create the proc entry [cite: 17]
-        proc_create(PROCFS_NAME, 0666, NULL, &lkm_proc_ops);
-    [cite_start] // World-readable and writable [cite: 18]
-        pr_info("/proc/%s created\n", PROCFS_NAME);
+    // Create the proc entry with permissions 0666 (world-readable and writable)
+    if (!proc_create("lkm_22CS10004_22CS10010", 0666, NULL, &lkm_proc_ops))
+    {
+        printk(KERN_ALERT "lkm_queue: Error: Could not initialize /proc/lkm_22CS10004_22CS10010\n");
+        return -ENOMEM;
+    }
+    printk(KERN_INFO "lkm_queue: /proc/lkm_22CS10004_22CS10010 created\n");
     return 0;
 }
 
 static void __exit lkm_exit(void)
 {
-    remove_proc_entry(PROCFS_NAME, NULL);
-    pr_info("/proc/%s removed\n", PROCFS_NAME);
+    remove_proc_entry("lkm_22CS10004_22CS10010", NULL);
+    printk(KERN_INFO "lkm_queue: /proc/lkm_22CS10004_22CS10010 removed\n");
 }
 
 module_init(lkm_init);
